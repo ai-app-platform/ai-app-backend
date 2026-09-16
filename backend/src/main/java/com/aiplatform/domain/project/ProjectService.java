@@ -1,11 +1,17 @@
 package com.aiplatform.domain.project;
 
+import com.aiplatform.domain.git.GitManagementService;
+import com.aiplatform.domain.memory.ShortTermMemoryService;
+import com.aiplatform.domain.rag.RagService;
+import com.aiplatform.domain.workspace.Workspace;
+import com.aiplatform.domain.workspace.WorkspaceService;
 import com.aiplatform.shared.exception.BusinessRuleViolationException;
 import com.aiplatform.shared.exception.EntityNotFoundException;
-import com.aiplatform.shared.service.CrudService;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -13,14 +19,18 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 @Transactional(readOnly = true)
-public class ProjectService implements CrudService<Project, ProjectCreateCommand, ProjectUpdateCommand> {
+public class ProjectService {
 
     private final ProjectRepository projectRepository;
+    private final GitManagementService gitManagementService;
+    private final WorkspaceService workspaceService;
+    private final RagService ragService;
+    private final ShortTermMemoryService shortTermMemoryService;
 
-    @Override
     @Transactional
     public Project create(ProjectCreateCommand command) {
         validateProjectName(command.name());
@@ -30,13 +40,59 @@ public class ProjectService implements CrudService<Project, ProjectCreateCommand
                 .description(command.description())
                 .repositoryUrl(command.repositoryUrl())
                 .defaultBranch(command.defaultBranch() != null ? command.defaultBranch() : "main")
+                .connectorId(command.connectorId())
                 .configuration(command.configuration())
                 .build();
 
-        return projectRepository.save(project);
+        project = projectRepository.save(project);
+
+        // Initialize workspace
+        String workspacePath = initializeWorkspace(project.getId(), command.repositoryUrl());
+        project.setWorkspacePath(workspacePath);
+        project = projectRepository.save(project);
+
+        // Clone repository and start indexing asynchronously
+        cloneAndIndexAsync(project.getId(), command.connectorId(), command.repositoryUrl(),
+                command.defaultBranch(), workspacePath);
+
+        return project;
     }
 
-    @Override
+    @Async
+    public void cloneAndIndexAsync(UUID projectId, UUID connectorId, String remoteUrl,
+                                    String defaultBranch, String workspacePath) {
+        try {
+            // 1. Clone repository
+            gitManagementService.registerAndClone(projectId, connectorId, remoteUrl, defaultBranch);
+            log.info("Repository cloned for project: {}", projectId);
+
+            // 2. Initialize .ai directory
+            shortTermMemoryService.initializeAiDirectory(workspacePath, projectId);
+
+            // 3. Generate short-term memory files
+            shortTermMemoryService.generateProjectOverview(workspacePath, projectId);
+            shortTermMemoryService.generateStackInfo(workspacePath, projectId);
+            shortTermMemoryService.generateStructureInfo(workspacePath, projectId);
+            shortTermMemoryService.generateModulesInfo(workspacePath, projectId);
+            shortTermMemoryService.generateClassesInfo(workspacePath, projectId);
+            shortTermMemoryService.generateDependenciesInfo(workspacePath, projectId);
+            log.info("Short-term memory generated for project: {}", projectId);
+
+            // 4. Get current commit SHA
+            String commitSha = gitManagementService.findByProjectOrThrow(projectId).getLastCommitSha();
+            if (commitSha == null) {
+                commitSha = "initial";
+            }
+
+            // 5. Index project in RAG (long-term memory)
+            ragService.indexProject(projectId, workspacePath, commitSha);
+            log.info("RAG indexing completed for project: {}", projectId);
+
+        } catch (Exception e) {
+            log.error("Failed to clone and index project: {}", projectId, e);
+        }
+    }
+
     @Transactional
     public Project update(UUID id, ProjectUpdateCommand command) {
         Project project = findByIdOrThrow(id);
@@ -58,12 +114,10 @@ public class ProjectService implements CrudService<Project, ProjectCreateCommand
         return projectRepository.findById(id);
     }
 
-    @Override
     public List<Project> findAll(int page, int size) {
         return projectRepository.findAll(PageRequest.of(page, size)).getContent();
     }
 
-    @Override
     @Transactional
     public void delete(UUID id) {
         Project project = findByIdOrThrow(id);
@@ -81,6 +135,12 @@ public class ProjectService implements CrudService<Project, ProjectCreateCommand
                 com.aiplatform.shared.domain.EntityStatus.ACTIVE,
                 PageRequest.of(page, size)
         );
+    }
+
+    private String initializeWorkspace(UUID projectId, String repositoryUrl) {
+        String basePath = "/tmp/ai-platform/workspaces/" + projectId.toString();
+        Workspace workspace = workspaceService.initialize(projectId, basePath);
+        return basePath;
     }
 
     private void validateProjectName(String name) {
